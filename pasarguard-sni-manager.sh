@@ -112,12 +112,11 @@ ensure_nginx_with_stream() {
             return 1
         fi
     else
-        log "Stream module already available — not adding a duplicate load_module line."
-        # Clean up any duplicate load_module line a previous run may have added,
-        # since the module is already loaded elsewhere.
-        if grep -rslq "ngx_stream_module" /etc/nginx/modules-enabled/ 2>/dev/null; then
-            sed -i '/^load_module modules\/ngx_stream_module.so;$/d' "$NGINX_MAIN"
-        fi
+        log "Stream module already available — ensuring no duplicate load_module line."
+        # The module is loaded elsewhere (built-in or modules-enabled). Any explicit
+        # load_module line we (or a previous run) added would cause a duplicate-load
+        # error, so strip it unconditionally.
+        sed -i '/^load_module modules\/ngx_stream_module.so;$/d' "$NGINX_MAIN"
     fi
 
     if ! grep -q "stream.conf.d" "$NGINX_MAIN" 2>/dev/null; then
