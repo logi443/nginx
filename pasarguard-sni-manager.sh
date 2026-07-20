@@ -92,18 +92,31 @@ ensure_nginx_with_stream() {
     fi
     mkdir -p /etc/nginx/stream.conf.d /etc/nginx/conf.d
 
-    # Detect whether the stream module is already available through ANY means:
-    # built-in, an auto-loaded file in modules-enabled, or an existing load_module line.
-    local stream_available="false"
-    if nginx -V 2>&1 | grep -q -- '--with-stream'; then
-        stream_available="true"
-    elif grep -rslq "ngx_stream_module" /etc/nginx/modules-enabled/ 2>/dev/null; then
-        stream_available="true"
-    elif grep -q "load_module.*ngx_stream_module.so" "$NGINX_MAIN" 2>/dev/null; then
-        stream_available="true"
+    # Disable nginx's default port-80 site so nginx never tries to bind :80
+    # (avoids clashing with any other service already on port 80).
+    if [[ -e /etc/nginx/sites-enabled/default ]]; then
+        log "Disabling nginx default site (port 80) to avoid conflicts..."
+        rm -f /etc/nginx/sites-enabled/default
     fi
 
-    if [[ "$stream_available" == "false" ]]; then
+    # Always remove any explicit load_module line for the stream module first,
+    # regardless of leading whitespace, so we start from a clean slate.
+    sed -i '/load_module .*ngx_stream_module\.so;/d' "$NGINX_MAIN"
+
+    # Determine whether the stream module is ALREADY auto-loaded. On Debian/Ubuntu,
+    # nginx-full ships /etc/nginx/modules-enabled/*.conf files (often symlinks) that
+    # each contain a load_module line. `cat` follows symlinks, so concatenating them
+    # and grepping is reliable where `grep -r` on the directory can miss symlinks.
+    local auto_loaded="false"
+    if cat /etc/nginx/modules-enabled/*.conf 2>/dev/null | grep -q 'ngx_stream_module\.so'; then
+        auto_loaded="true"
+    elif nginx -V 2>&1 | grep -q -- '--with-stream'; then
+        auto_loaded="true"
+    fi
+
+    if [[ "$auto_loaded" == "true" ]]; then
+        log "Stream module already provided by nginx — no explicit load_module needed."
+    else
         if [[ -f /usr/lib/nginx/modules/ngx_stream_module.so || -f /usr/share/nginx/modules/ngx_stream_module.so ]]; then
             log "Loading stream module explicitly..."
             sed -i '1i load_module modules/ngx_stream_module.so;' "$NGINX_MAIN"
@@ -111,12 +124,6 @@ ensure_nginx_with_stream() {
             err "Stream module not found. Install it (e.g. apt-get install libnginx-mod-stream) and retry."
             return 1
         fi
-    else
-        log "Stream module already available — ensuring no duplicate load_module line."
-        # The module is loaded elsewhere (built-in or modules-enabled). Any explicit
-        # load_module line we (or a previous run) added would cause a duplicate-load
-        # error, so strip it unconditionally.
-        sed -i '/^load_module modules\/ngx_stream_module.so;$/d' "$NGINX_MAIN"
     fi
 
     if ! grep -q "stream.conf.d" "$NGINX_MAIN" 2>/dev/null; then
@@ -128,6 +135,15 @@ stream {
     include /etc/nginx/stream.conf.d/*.conf;
 }
 EOF
+    fi
+
+    # Raise connection limits for high-traffic routing (idempotent).
+    if ! grep -q "worker_rlimit_nofile" "$NGINX_MAIN" 2>/dev/null; then
+        log "Raising worker_rlimit_nofile for high traffic..."
+        sed -i '/^worker_processes/a worker_rlimit_nofile 65535;' "$NGINX_MAIN"
+    fi
+    if grep -qE "worker_connections\s+[0-9]+;" "$NGINX_MAIN" 2>/dev/null; then
+        sed -i -E 's/worker_connections\s+[0-9]+;/worker_connections 16384;/' "$NGINX_MAIN"
     fi
 }
 
@@ -173,11 +189,17 @@ upstream legacy_backend {
 }
 
 server {
-    listen ${PUBLIC_PORT};
-    listen [::]:${PUBLIC_PORT};
+    listen ${PUBLIC_PORT} reuseport;
+    listen [::]:${PUBLIC_PORT} reuseport;
     proxy_pass \$sni_backend_pool;
     ssl_preread on;
-    proxy_timeout 300s;
+
+    # High-traffic tuning
+    proxy_timeout 1h;                 # long-lived tunnels shouldn't be cut at 5m
+    proxy_connect_timeout 10s;
+    proxy_buffer_size 32k;            # larger buffer for high-throughput streams
+    proxy_socket_keepalive on;
+    tcp_nodelay on;
 }
 EOF
     else
